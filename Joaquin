@@ -1,1 +1,170 @@
+#%%
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from lazypredict.Supervised import LazyRegressor
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+from sklearn.linear_model import OrthogonalMatchingPursuitCV
+from sklearn.model_selection import train_test_split
+from feature_engine.outliers import Winsorizer
 
+
+data = pd.read_csv('train.csv')
+test_data = pd.read_csv('test.csv')
+
+# Drop supermarkets column, too little data
+# Baths look fine
+# Rooms over 4 either drop or find new values using baths and sqr_meters
+# Negative values for sqr_meters
+# Fix soutx on orientation and missing values fix using KNN
+# Missing values on year fix using KNN
+# Added floor and nbr fix missing values with KNN
+# Furnished fix missing values with KNN
+# Pool fix missing values with KNN based on price, year and Neighborhood
+# Neighborhood fix missing values with KNN based on price and num_crimes
+# Num_crimes fix missing values with KNN based on price and Neighborhood
+# Has_ac fix missing values with KNN
+# Accepts_pets fix missing values with KNN
+#%%
+capper = Winsorizer(capping_method = 'gaussian',
+                    #Which tail to cap values, here I choose the right tail to cap high values
+                    tail = 'both',
+                    #Fold indicates the number of standard deviations
+                    fold = 3,
+                    variables = ['price'])
+
+#Fit the capper to the data
+capper.fit(data)
+#Cap extreme values in the data
+data = capper.transform(data)
+#Call .describe() on the transformed dataframe
+data.describe()
+
+#%%
+
+# Drop Supermarket and Orientation columns and put NaN in extreme values of sqr_mts and rooms
+cleaned_data = data.drop(columns=['num_supermarkets','orientation'])
+cleaned_data['square_meters'] = np.where(cleaned_data['square_meters']<0, np.NaN, cleaned_data['square_meters'])
+cleaned_data['num_rooms'] = np.where(cleaned_data['num_rooms']>6, np.NaN, cleaned_data['num_rooms'])
+cleaned_data = cleaned_data.dropna(subset=['num_rooms', 'num_baths', 'square_meters', 'door', 
+    'neighborhood', 'num_crimes', 'price'])
+
+cleaned_test = test_data.drop(columns=['num_supermarkets','orientation'])
+cleaned_test['square_meters'] = np.where(cleaned_test['square_meters']<0, np.NaN, cleaned_test['square_meters'])
+cleaned_test['num_rooms'] = np.where(cleaned_test['num_rooms']>6, np.NaN, cleaned_test['num_rooms'])
+
+# Join data and add floor info
+total_data = pd.concat([cleaned_data, cleaned_test])
+total_data[['floor', 'nbr']] = total_data['door'].str.extract(r'(\d+)º - (\d)[a-zA-Z]?')
+total_data['floor'] = pd.to_numeric(total_data['floor'], errors='coerce').convert_dtypes()
+total_data['nbr'] = pd.to_numeric(total_data['nbr'], errors='coerce').convert_dtypes()
+total_data.reset_index(inplace=True)
+total_data = total_data.drop(columns=['door','index'])
+
+# Fill Sqr_mts missing values with mean
+total_data['square_meters'] = np.where(total_data['square_meters']<0, np.NaN, total_data['square_meters'])
+total_data['square_meters'] = total_data['square_meters'].fillna(total_data['square_meters'].mean())
+total_data['num_rooms'] = np.where(total_data['num_rooms']>6, np.NaN, total_data['num_rooms'])
+
+# Fill missing data in rooms, baths and year by sorting sqr_mts and using ffill
+total_data.sort_values('square_meters', inplace=True)
+total_data[['num_rooms', 'square_meters', 'num_baths', 'year_built']] = total_data[['num_rooms', 'square_meters', 'num_baths', 'year_built']].ffill()
+
+# Fill missing data in neighborhood by sorting other values and using ffill
+total_data.sort_values(['year_built', 'num_rooms', 'square_meters', 'num_baths'], inplace=True)
+total_data[['neighborhood']] = total_data[['neighborhood']].ffill()
+total_data.reset_index(inplace=True)
+
+#%%
+# Apply one-hot encoding and Convert the encoded data back to a dataframe for Neighborhood
+encoder = OneHotEncoder()
+encoded_data1 = encoder.fit_transform(total_data[['neighborhood']]).toarray()
+encoded_data1 = pd.DataFrame(encoded_data1, columns=encoder.get_feature_names_out (['neighborhood']))
+
+# Concatenate the encoded dataframe with the 'id' column
+total_data = pd.concat([total_data.drop(columns=['neighborhood']), encoded_data1], axis=1)
+#%%
+# Create KNNImputer object with k=5
+imputer = KNNImputer(n_neighbors=5)
+
+# Perform KNN imputation
+imputed_td = imputer.fit_transform(total_data[['id', 'num_rooms', 'num_baths', 'square_meters', 'year_built',
+    'is_furnished', 'has_pool', 'num_crimes', 'has_ac', 'accepts_pets',
+    'floor', 'nbr', 'neighborhood_Ciutat Vella',
+    'neighborhood_Eixample', 'neighborhood_Gràcia', 'neighborhood_Horta',
+    'neighborhood_Les Cors', 'neighborhood_Nou Barris',
+    'neighborhood_Sant Andreu', 'neighborhood_Sant Martí',
+    'neighborhood_Sants', 'neighborhood_Sarrià-Sant Gervasi']])
+
+# Convert the imputed data back to DataFrame
+imputed_td = pd.DataFrame(imputed_td, columns=total_data[['id', 'num_rooms', 'num_baths', 'square_meters', 'year_built',
+    'is_furnished', 'has_pool', 'num_crimes', 'has_ac', 'accepts_pets',
+    'floor', 'nbr', 'neighborhood_Ciutat Vella',
+    'neighborhood_Eixample', 'neighborhood_Gràcia', 'neighborhood_Horta',
+    'neighborhood_Les Cors', 'neighborhood_Nou Barris',
+    'neighborhood_Sant Andreu', 'neighborhood_Sant Martí',
+    'neighborhood_Sants', 'neighborhood_Sarrià-Sant Gervasi']].columns)
+
+# Aproximate values to True or False
+imputed_td[['is_furnished', 'has_pool', 'num_crimes', 'has_ac', 'accepts_pets']] = imputed_td[['is_furnished', 'has_pool', 'num_crimes', 'has_ac', 'accepts_pets']].round()
+
+def get_neighborhood(row):
+    neighborhood_cols = [col for col in imputed_td.columns if col.startswith('neighborhood_')]
+    if row[neighborhood_cols].sum() == 0:
+        return 'None'
+    else:
+        return row[neighborhood_cols].idxmax().replace('neighborhood_', '')
+
+# Return Neighborhood and Orientation
+imputed_td['neighborhood'] = imputed_td.apply(get_neighborhood, axis=1)
+imputed_td = imputed_td.drop(columns=['neighborhood_Ciutat Vella',
+    'neighborhood_Eixample', 'neighborhood_Gràcia', 'neighborhood_Horta',
+    'neighborhood_Les Cors', 'neighborhood_Nou Barris',
+    'neighborhood_Sant Andreu', 'neighborhood_Sant Martí',
+    'neighborhood_Sants', 'neighborhood_Sarrià-Sant Gervasi'])
+
+imputed_td = imputed_td.join(total_data[['id', 'price']].set_index('id'), on='id', rsuffix='_total', how='left')
+
+# %%
+# Separate data from test
+cleaned_test = imputed_td[['id', 'square_meters', 'floor', 'neighborhood', 'num_crimes']][imputed_td['price'].isnull()]
+cleaned_data = imputed_td.dropna(subset=['price']).drop(columns=['nbr', 'year_built'])
+
+# Encode categorical variables
+le = LabelEncoder()
+cleaned_data.loc[:, 'neighborhood'] = le.fit_transform(cleaned_data['neighborhood'])
+
+# Predict with Lazy Prediction
+cleaned_test['price'] = np.nan
+
+# Define features and target
+X = cleaned_data[['square_meters', 'floor', 'neighborhood', 'num_crimes']]
+y = cleaned_data['price']
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=333)
+
+# Use LazyRegressor for automatic model selection and evaluation
+reg = LazyRegressor(verbose=0, ignore_warnings=True, custom_metric=None)
+models, predictions = reg.fit(X_train, X_test, y_train, y_test)
+
+# Display the models and their performance metrics
+print(models)
+
+# The predictions DataFrame contains the predicted values from various models
+print(predictions)
+
+#%% Run Model
+# Encode categorical variables
+cleaned_test.loc[:, 'neighborhood'] = le.fit_transform(cleaned_test['neighborhood'])
+
+# Choose the best model (in this case, LassoLarsIC)
+best_model = OrthogonalMatchingPursuitCV()
+best_model.fit(X, y)
+
+cleaned_test['price'] = best_model.predict(cleaned_test.drop(columns=['id', 'price']))
+
+#%%
+# Export cleaned_test id and prices rounded and without decimals to a csv
+cleaned_test[['id','price']].astype(int).to_csv('submission.csv', index=False)
